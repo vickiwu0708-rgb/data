@@ -1,0 +1,5 @@
+papers_processed.json
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
