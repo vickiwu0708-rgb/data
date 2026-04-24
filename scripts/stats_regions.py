@@ -6,17 +6,65 @@ CN_FILE = "大夫山观赏乔木 - 国内分布.csv"
 WW_FILE = "大夫山观赏乔木 - 国外分布.csv"
 OUT_DIR = "stats_output"
 
-N_SPECIES_EXPECT = 150  # 文件里应为150条记录（不含表头）
+# ---------- 工具：编码探测读取 ----------
+CANDIDATE_ENCODINGS = ["utf-8-sig", "gb18030", "gbk", "utf-8"]
+
+def open_text_auto(path):
+    last_err = None
+    for enc in CANDIDATE_ENCODINGS:
+        try:
+            f = open(path, "r", encoding=enc, errors="strict", newline="")
+            # 试读一点点触发解码
+            f.read(1024)
+            f.seek(0)
+            return f, enc
+        except Exception as e:
+            last_err = e
+    # 兜底：用 replace，保证不崩，但可能仍乱码
+    f = open(path, "r", encoding="utf-8", errors="replace", newline="")
+    return f, "utf-8(replace)"
+
+ZERO_WIDTH = {
+    "\ufeff",  # BOM
+    "\u200b",  # zero width space
+    "\u200c",
+    "\u200d",
+    "\u2060",
+}
+
+def clean_text(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    for ch in ZERO_WIDTH:
+        s = s.replace(ch, "")
+    return s.strip()
 
 def split_tokens(s: str):
-    s = (s or "").strip()
+    s = clean_text(s)
     if not s:
         return []
-    # 兼容中英文逗号
+    # 统一分隔符：中文逗号/英文逗号 -> 顿号
     s = s.replace("，", "、").replace(",", "、")
-    return [t.strip() for t in s.split("、") if t.strip()]
+    return [clean_text(t) for t in s.split("、") if clean_text(t)]
 
-# ---------- 国内：token -> 区域 ----------
+def read_col4_tokens(file_path):
+    """
+    读取CSV第4列（索引3），按“、/逗号”拆分成 tokens（每行一个 token list）。
+    """
+    rows = []
+    f, enc = open_text_auto(file_path)
+    with f:
+        r = csv.reader(f)
+        header = next(r, None)  # skip header
+        for row in r:
+            if not row:
+                continue
+            val = row[3] if len(row) > 3 else ""
+            rows.append(split_tokens(val))
+    return rows, enc
+
+# ---------- 国内：token -> 区域（七大区 + 台湾单列 + 全国/泛分布单列） ----------
 CN_REGION_MAP = {
     "华南": ["广东", "广西", "海南"],
     "西南": ["云南", "贵州", "四川", "重庆", "西藏"],
@@ -28,20 +76,25 @@ CN_REGION_MAP = {
 }
 
 def cn_token_to_region(tok: str) -> str:
-    # 台湾单列（含“台湾有栽培”等）
+    tok = clean_text(tok)
+
+    # 台湾单列（1A：台湾不并入七大区）
     if "台湾" in tok:
         return "台湾地区"
-    # 全国/泛分布（你指定2A）
+
+    # 2A：泛描述单列
     if ("全国" in tok) or ("各地" in tok) or ("长江流域" in tok) or ("广泛" in tok):
         return "全国/泛分布"
-    # 命中省份关键词则归入区域
+
+    # 省份关键词命中即归入对应区域（例如“广东南部”也能命中“广东”→华南）
     for region, keys in CN_REGION_MAP.items():
         for k in keys:
             if k in tok:
                 return region
+
     return "其他/未映射"
 
-# ---------- 国外：token -> 世界大区 ----------
+# ---------- 国外：token -> 世界区域 ----------
 SEA = {"越南","泰国","缅甸","老挝","柬埔寨","马来西亚","印度尼西亚","菲律宾","新加坡","文莱","东帝汶"}
 SA  = {"印度","斯里兰卡","尼泊尔","孟加拉国","巴基斯坦"}
 EA  = {"日本","朝鲜","韩国"}
@@ -49,6 +102,7 @@ OCE = {"澳大利亚","新西兰"}
 AME = {"墨西哥","古巴","美国","巴西","阿根廷","智利","秘鲁","加拿大"}
 
 def ww_token_to_region(tok: str) -> str:
+    tok = clean_text(tok)
     if tok in {"无", "/"}:
         return "缺失/未记录"
     if tok in SEA:
@@ -63,52 +117,44 @@ def ww_token_to_region(tok: str) -> str:
         return "美洲"
     return "其他国家/地区"
 
-# ---------- 五类分布型（每物种唯一归类） ----------
-# 你指定：澳大利亚按热带分布（口径B）
-TROPICAL_REGIONS = {"东南亚", "南亚", "大洋洲"}  # 大洋洲在此口径下并入热带判定
+# ---------- 5类分布型（每物种唯一归类） ----------
+# 你确认：澳大利亚按“热带分布”口径
+TROPICAL_REGIONS = {"东南亚", "南亚", "大洋洲"}  # 大洋洲(含澳大利亚)视为热带
 
 def five_type(ww_tokens):
-    # 中国特有：国外分布为“无”或“/”（你指定）
+    ww_tokens = [clean_text(t) for t in ww_tokens if clean_text(t)]
+
+    # 你要求：国外分布无或/ => 中国特有分布
     if len(ww_tokens) == 1 and ww_tokens[0] in {"无", "/"}:
         return "中国特有分布"
 
-    regions = {ww_token_to_region(t) for t in ww_tokens if t not in {"无", "/"}}
-    # 若完全没有效国家（空白等），也按中国特有（与“缺失/未记录”一致处理）
+    regions = {ww_token_to_region(t) for t in ww_tokens if t not in {"无", "/"} and t}
+
+    # 空/全缺失也视为中国特有（与口径一致）
     if not regions:
         return "中国特有分布"
 
-    # 东亚分布：仅出现东亚国家
+    # 仅东亚
     if regions.issubset({"东亚"}):
         return "东亚分布"
 
-    # 世界分布：跨两个及以上世界大区（含“其他国家/地区”也算一个大区）
+    # 跨两个及以上世界区域 => 世界分布
     if len(regions) >= 2:
         return "世界分布"
 
-    # 此时 regions 只有一个值
     only = next(iter(regions))
     if only in TROPICAL_REGIONS:
         return "热带分布"
+
+    # 理论上“温带分布”主要在出现温带区但非仅东亚时；你这套数据里温带通常由东亚承载
+    # 若未来出现欧洲/北美等，也可在此扩展为温带
     if only == "东亚":
         return "温带分布"
 
-    # 兜底：其他国家/地区
     return "世界分布"
 
-def read_col4_tokens(file_path):
-    values = []
-    with open(file_path, "r", encoding="utf-8", errors="replace", newline="") as f:
-        r = csv.reader(f)
-        header = next(r, None)
-        for row in r:
-            if not row:
-                continue
-            # 第4列索引=3
-            s = row[3].strip() if len(row) > 3 else ""
-            values.append(split_tokens(s))
-    return values
-
-def write_counter_csv(path, counter: Counter, n_species: int, *, include_token_share=True):
+# ---------- 输出 ----------
+def write_counter_csv(path, counter: Counter, n_species: int, include_token_share=True):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     total_tokens = sum(counter.values()) if counter else 0
     with open(path, "w", encoding="utf-8", newline="") as f:
@@ -126,41 +172,42 @@ def write_counter_csv(path, counter: Counter, n_species: int, *, include_token_s
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    cn_tokens_by_row = read_col4_tokens(CN_FILE)
-    ww_tokens_by_row = read_col4_tokens(WW_FILE)
+    cn_tokens_by_row, cn_enc = read_col4_tokens(CN_FILE)
+    ww_tokens_by_row, ww_enc = read_col4_tokens(WW_FILE)
 
     n = len(cn_tokens_by_row)
     if len(ww_tokens_by_row) != n:
         raise RuntimeError(f"国内/国外记录行数不一致：{n} vs {len(ww_tokens_by_row)}")
 
-    # 国内区域频次（token计数）
+    # 国内：区域频次（token计数）
     cn_region_freq = Counter()
     for toks in cn_tokens_by_row:
         for tok in toks:
             cn_region_freq[cn_token_to_region(tok)] += 1
 
-    # 国外世界区域频次（token计数）
+    # 国外：世界区域频次（token计数）
     ww_region_freq = Counter()
     for toks in ww_tokens_by_row:
         for tok in toks:
             ww_region_freq[ww_token_to_region(tok)] += 1
 
-    # 五类分布型（每物种唯一归类）
+    # 五类分布型（每物种唯一）
     five_freq = Counter(five_type(toks) for toks in ww_tokens_by_row)
 
     write_counter_csv(os.path.join(OUT_DIR, "国内分布_区域统计.csv"), cn_region_freq, n)
     write_counter_csv(os.path.join(OUT_DIR, "国外分布_世界区域统计.csv"), ww_region_freq, n)
     write_counter_csv(os.path.join(OUT_DIR, "五类分布型_统计.csv"), five_freq, n, include_token_share=False)
 
-    # 同时输出一个简单说明
     with open(os.path.join(OUT_DIR, "README.md"), "w", encoding="utf-8") as f:
-        f.write("# 大夫山观赏乔木 分布统计输出\n\n")
-        f.write(f"- 物种记录行数 n={n}\n")
-        f.write("- 国内分布：按“、”拆分后，省份关键词映射到中国地理分区；台湾单列；泛描述单列。\n")
-        f.write("- 国外分布：按“、”拆分后，国家映射到世界区域；“无”和“/”合并为“缺失/未记录”。\n")
-        f.write("- 五类分布型：世界/热带/温带/东亚/中国特有；其中澳大利亚按热带口径处理。\n")
+        f.write("# 分布统计输出（自动编码识别版）\n\n")
+        f.write(f"- 国内文件编码尝试顺序：{', '.join(CANDIDATE_ENCODINGS)}；实际使用：{cn_enc}\n")
+        f.write(f"- 国外文件编码尝试顺序：{', '.join(CANDIDATE_ENCODINGS)}；实际使用：{ww_enc}\n")
+        f.write(f"- 物种行数 n={n}\n")
+        f.write("- 台湾单列；国内泛描述单列。\n")
+        f.write("- 国外“无”和“/”合并为“缺失/未记录”。\n")
+        f.write("- 5类分布型：世界/热带/温带/东亚/中国特有；澳大利亚按热带口径处理。\n")
 
-    print(f"OK: 输出已生成在 {OUT_DIR}/ ，物种行数 n={n}")
+    print(f"OK: 输出已生成在 {OUT_DIR}/ ，物种行数 n={n}；国内编码={cn_enc}；国外编码={ww_enc}")
 
 if __name__ == "__main__":
     main()
