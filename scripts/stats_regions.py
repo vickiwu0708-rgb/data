@@ -75,21 +75,27 @@ CN_REGION_MAP = {
     "西北": ["陕西", "甘肃", "青海", "宁夏", "新疆"],
 }
 
+MERGE_TO_NATIONAL = {"华东", "华中"}
+NATIONAL_KEYWORDS = ["秦岭"]
+
 def cn_token_to_region(tok: str) -> str:
     tok = clean_text(tok)
 
-    # 台湾单列（1A：台湾不并入七大区）
     if "台湾" in tok:
         return "台湾地区"
 
-    # 2A：泛描述单列
     if ("全国" in tok) or ("各地" in tok) or ("长江流域" in tok) or ("广泛" in tok):
         return "全国/泛分布"
 
-    # 省份关键词命中即归入对应区域（例如“广东南部”也能命中“广东”→华南）
+    for kw in NATIONAL_KEYWORDS:
+        if kw in tok:
+            return "全国/泛分布"
+
     for region, keys in CN_REGION_MAP.items():
         for k in keys:
             if k in tok:
+                if region in MERGE_TO_NATIONAL:
+                    return "全国/泛分布"
                 return region
 
     return "其他/未映射"
@@ -115,40 +121,60 @@ def ww_token_to_region(tok: str) -> str:
         return "大洋洲"
     if tok in AME:
         return "美洲"
+    if "非洲" in tok:
+        return "非洲"
+    if "地中海" in tok:
+        return "地中海"
     return "其他国家/地区"
 
 # ---------- 5类分布型（每物种唯一归类） ----------
 # 你确认：澳大利亚按“热带分布”口径
-TROPICAL_REGIONS = {"东南亚", "南亚", "大洋洲"}  # 大洋洲(含澳大利亚)视为热带
+TROPICAL_REGIONS = {"东南亚", "南亚", "大洋洲", "非洲"}
+TEMPERATE_REGIONS = {"地中海"}
+
+def _five_type_token(tok: str) -> str:
+    if "非洲" in tok or "中南半岛" in tok:
+        return "热带"
+    if "地中海" in tok:
+        return "温带"
+    region = ww_token_to_region(tok)
+    if region in TROPICAL_REGIONS:
+        return "热带"
+    if region in TEMPERATE_REGIONS or region == "东亚":
+        return "温带"
+    if region in {"缺失/未记录"}:
+        return "缺失"
+    return region
 
 def five_type(ww_tokens):
     ww_tokens = [clean_text(t) for t in ww_tokens if clean_text(t)]
 
-    # 你要求：国外分布无或/ => 中国特有分布
     if len(ww_tokens) == 1 and ww_tokens[0] in {"无", "/"}:
         return "中国特有分布"
 
-    regions = {ww_token_to_region(t) for t in ww_tokens if t not in {"无", "/"} and t}
-
-    # 空/全缺失也视为中国特有（与口径一致）
-    if not regions:
+    valid = [t for t in ww_tokens if t not in {"无", "/"} and t]
+    if not valid:
         return "中国特有分布"
 
-    # 仅东亚
-    if regions.issubset({"东亚"}):
+    types = {_five_type_token(t) for t in valid}
+    types.discard("缺失")
+
+    if not types:
+        return "中国特有分布"
+
+    regions = {ww_token_to_region(t) for t in valid if t not in {"无", "/"}}
+    regions.discard("缺失/未记录")
+
+    if regions.issubset({"东亚"}) and not any("非洲" in t or "中南半岛" in t or "地中海" in t for t in valid):
         return "东亚分布"
 
-    # 跨两个及以上世界区域 => 世界分布
-    if len(regions) >= 2:
+    if len(types) >= 2:
         return "世界分布"
 
-    only = next(iter(regions))
-    if only in TROPICAL_REGIONS:
+    only = next(iter(types))
+    if only == "热带":
         return "热带分布"
-
-    # 理论上“温带分布”主要在出现温带区但非仅东亚时；你这套数据里温带通常由东亚承载
-    # 若未来出现欧洲/北美等，也可在此扩展为温带
-    if only == "东亚":
+    if only == "温带":
         return "温带分布"
 
     return "世界分布"
@@ -179,17 +205,23 @@ def main():
     if len(ww_tokens_by_row) != n:
         raise RuntimeError(f"国内/国外记录行数不一致：{n} vs {len(ww_tokens_by_row)}")
 
-    # 国内：区域频次（token计数）
     cn_region_freq = Counter()
     for toks in cn_tokens_by_row:
+        seen = set()
         for tok in toks:
-            cn_region_freq[cn_token_to_region(tok)] += 1
+            region = cn_token_to_region(tok)
+            if region not in seen:
+                seen.add(region)
+                cn_region_freq[region] += 1
 
-    # 国外：世界区域频次（token计数）
     ww_region_freq = Counter()
     for toks in ww_tokens_by_row:
+        seen = set()
         for tok in toks:
-            ww_region_freq[ww_token_to_region(tok)] += 1
+            region = ww_token_to_region(tok)
+            if region not in seen:
+                seen.add(region)
+                ww_region_freq[region] += 1
 
     # 五类分布型（每物种唯一）
     five_freq = Counter(five_type(toks) for toks in ww_tokens_by_row)
